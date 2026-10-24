@@ -59,10 +59,7 @@ def init_db() -> None:
           id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT NOT NULL, body TEXT NOT NULL DEFAULT '', subject_id INTEGER REFERENCES subjects(id) ON DELETE SET NULL, updated_at TEXT NOT NULL
         );
         CREATE TABLE IF NOT EXISTS resources (
-          id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT NOT NULL, kind TEXT NOT NULL, url TEXT NOT NULL DEFAULT '', file_name TEXT NOT NULL DEFAULT '', stored_name TEXT NOT NULL DEFAULT '', extracted_text TEXT NOT NULL DEFAULT '', transcript TEXT NOT NULL DEFAULT '', subject_id INTEGER REFERENCES subjects(id) ON DELETE SET NULL, created_at TEXT NOT NULL, page_count INTEGER NOT NULL DEFAULT 0, is_scanned INTEGER NOT NULL DEFAULT 0
-        );
-        CREATE TABLE IF NOT EXISTS reading_progress (
-          resource_id INTEGER PRIMARY KEY REFERENCES resources(id) ON DELETE CASCADE, last_page INTEGER NOT NULL DEFAULT 1, font_size INTEGER NOT NULL DEFAULT 14, line_spacing REAL NOT NULL DEFAULT 1.5, content_width TEXT NOT NULL DEFAULT 'full', theme TEXT NOT NULL DEFAULT 'dark', updated_at TEXT NOT NULL
+          id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT NOT NULL, kind TEXT NOT NULL, url TEXT NOT NULL DEFAULT '', file_name TEXT NOT NULL DEFAULT '', stored_name TEXT NOT NULL DEFAULT '', extracted_text TEXT NOT NULL DEFAULT '', transcript TEXT NOT NULL DEFAULT '', subject_id INTEGER REFERENCES subjects(id) ON DELETE SET NULL, created_at TEXT NOT NULL
         );
         CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
         """)
@@ -234,53 +231,8 @@ def get_saved_transcript(resource_id: int):
     return resource
 
 
-@app.put("/api/resources/{resource_id}/progress")
-def update_reading_progress(resource_id: int, payload: dict[str, Any]):
-    last_page = payload.get("last_page", 1)
-    font_size = payload.get("font_size", 14)
-    line_spacing = payload.get("line_spacing", 1.5)
-    content_width = payload.get("content_width", "full")
-    theme = payload.get("theme", "dark")
-    with db() as conn:
-        conn.execute("""
-            INSERT INTO reading_progress(resource_id, last_page, font_size, line_spacing, content_width, theme, updated_at)
-            VALUES(?,?,?,?,?,?,?)
-            ON CONFLICT(resource_id) DO UPDATE SET last_page=?, font_size=?, line_spacing=?, content_width=?, theme=?, updated_at=?
-        """, (resource_id, last_page, font_size, line_spacing, content_width, theme, now(), last_page, font_size, line_spacing, content_width, theme, now()))
-    return {"ok": True}
-
-
-@app.get("/api/resources/{resource_id}/progress")
-def get_reading_progress(resource_id: int):
-    with db() as conn:
-        row = conn.execute("SELECT last_page, font_size, line_spacing, content_width, theme FROM reading_progress WHERE resource_id=?", (resource_id,)).fetchone()
-    if not row:
-        return {"last_page": 1, "font_size": 14, "line_spacing": 1.5, "content_width": "full", "theme": "dark"}
-    return {"last_page": row[0], "font_size": row[1], "line_spacing": row[2], "content_width": row[3], "theme": row[4]}
-
-
-@app.get("/api/library/{resource_id}/text")
-def pdf_text(resource_id: int):
-    resource = one("SELECT id,title,extracted_text,page_count,is_scanned FROM resources WHERE id=? AND kind='pdf'", (resource_id,))
-    if not resource:
-        raise HTTPException(404, "PDF not found")
-    return resource
-
-
-@app.get("/api/library/{resource_id}/text/page/{page_num}")
-def pdf_text_page(resource_id: int, page_num: int):
-    resource = one("SELECT id,extracted_text,page_count,is_scanned FROM resources WHERE id=? AND kind='pdf'", (resource_id,))
-    if not resource:
-        raise HTTPException(404, "PDF not found")
-    if page_num < 1 or page_num > resource["page_count"]:
-        raise HTTPException(404, "Page number out of range")
-    pages_text = resource["extracted_text"].split("\n\n")
-    page_text = pages_text[page_num - 1] if page_num - 1 < len(pages_text) else ""
-    return {"page": page_num, "page_count": resource["page_count"], "text": page_text, "is_scanned": resource["is_scanned"]}
-
-
 @app.delete("/api/resources/{resource_id}")
-def delete_resource(resource_id: int, permanent: bool = False):
+def delete_resource(resource_id: int):
     resource = one("SELECT stored_name FROM resources WHERE id=?", (resource_id,))
     if not resource:
         raise HTTPException(404, "Resource not found")
@@ -288,12 +240,7 @@ def delete_resource(resource_id: int, permanent: bool = False):
         conn.execute("DELETE FROM resources WHERE id=?", (resource_id,))
     if resource["stored_name"]:
         (FILES_DIR / resource["stored_name"]).unlink(missing_ok=True)
-    return {"ok": True, "permanent": permanent}
-
-
-@app.delete("/api/resources/{resource_id}")
-def delete_resource_endpoint(resource_id: int, permanent: bool = False):
-    return delete_resource(resource_id, permanent)
+    return {"ok": True}
 
 
 @app.post("/api/library/pdf")
@@ -309,28 +256,19 @@ async def upload_pdf(file: UploadFile = File(...), subject_id: int | None = None
     stored_name = secrets.token_hex(16) + ".pdf"
     path = FILES_DIR / stored_name
     path.write_bytes(content)
-    extracted_pages: list[str] = []
-    page_count = 0
-    is_scanned = False
+    extracted = ""
     try:
         from pypdf import PdfReader
         import io
         reader = PdfReader(io.BytesIO(content))
-        page_count = len(reader.pages)
-        for page in reader.pages:
-            text = page.extract_text() or ""
-            extracted_pages.append(text)
-            if not text.strip():
-                is_scanned = True
-        extracted = "\n\n".join(extracted_pages)
+        extracted = "\n\n".join((page.extract_text() or "") for page in reader.pages)
     except Exception as exc:
         path.unlink(missing_ok=True)
         raise HTTPException(422, "Could not extract text from this PDF. It may be damaged or scanned; OCR is not included yet.") from exc
     with db() as conn:
-        cur = conn.execute("INSERT INTO resources(title,kind,file_name,stored_name,extracted_text,subject_id,created_at,page_count,is_scanned) VALUES(?,?,?,?,?,?,?,?,?)", (filename, "pdf", filename, stored_name, extracted, subject_id, now(), page_count, is_scanned))
+        cur = conn.execute("INSERT INTO resources(title,kind,file_name,stored_name,extracted_text,subject_id,created_at) VALUES(?,?,?,?,?,?,?)", (filename, "pdf", filename, stored_name, extracted, subject_id, now()))
         resource_id = cur.lastrowid
-    resource = one("SELECT id,title,kind,file_name,subject_id,created_at,page_count,is_scanned,length(extracted_text) AS text_length FROM resources WHERE id=?", (resource_id,))
-    return {**resource, "pages_text": page_count, "has_text": not is_scanned, "extracted_pages": page_count, "is_scanned": is_scanned}
+    return {**one("SELECT id,title,kind,file_name,subject_id,created_at,length(extracted_text) AS text_length FROM resources WHERE id=?", (resource_id,)), "pages_text": len(extracted), "has_text": bool(extracted.strip())}
 
 
 @app.get("/api/library/{resource_id}/file")
