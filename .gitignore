@@ -1,7 +1,14 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+
+# Frontend
 node_modules/
 dist/
-.venv/
-__pycache__/
-*.pyc
+
+# Local data and credentials
 .env
-data/
+*.sqlite3
+*.sqlite3-shm
+*.sqlite3-wal
